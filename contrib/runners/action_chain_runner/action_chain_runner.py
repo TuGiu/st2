@@ -33,12 +33,14 @@ from st2common.models.db.liveaction import LiveActionDB
 from st2common.models.system import actionchain
 from st2common.models.utils import action_param_utils
 from st2common.persistence.execution import ActionExecution
+from st2common.persistence.liveaction import LiveAction
 from st2common.services import action as action_service
 from st2common.services import keyvalues as kv_service
 from st2common.util import action_db as action_db_util
 from st2common.util import isotime
 from st2common.util import date as date_utils
 from st2common.util import jinja as jinja_utils
+from st2common.util import param as param_utils
 from st2common.util.config_loader import get_config
 
 
@@ -407,6 +409,252 @@ class ActionChainRunner(ActionRunner):
                     status = action_constants.LIVEACTION_STATUS_CANCELED
                     return (status, result, None)
 
+                if self.liveaction_id:
+                    self._stopped = action_service.is_action_paused_or_pausing(
+                        self.liveaction_id)
+
+                if self._stopped:
+                    LOG.info('Chain execution (%s) paused by user.', self.liveaction_id)
+                    status = action_constants.LIVEACTION_STATUS_PAUSED
+                    return (status, result, None)
+
+                try:
+                    if not liveaction:
+                        fail = True
+                        action_node = self.chain_holder.get_next_node(action_node.name,
+                                                                      condition='on-failure')
+                    elif liveaction.status in action_constants.LIVEACTION_FAILED_STATES:
+                        if liveaction.status == action_constants.LIVEACTION_STATUS_TIMED_OUT:
+                            timeout = True
+                        else:
+                            fail = True
+                        action_node = self.chain_holder.get_next_node(action_node.name,
+                                                                      condition='on-failure')
+                    elif liveaction.status == action_constants.LIVEACTION_STATUS_CANCELED:
+                        # User canceled an action (task) in the workflow - cancel the execution of
+                        # rest of the workflow
+                        self._stopped = True
+                        LOG.info('Chain execution (%s) canceled by user.', self.liveaction_id)
+                    elif liveaction.status == action_constants.LIVEACTION_STATUS_PAUSED:
+                        # User paused an action (task) in the workflow - pause the execution of
+                        # rest of the workflow
+                        self._stopped = True
+                        LOG.info('Chain execution (%s) paused by user.', self.liveaction_id)
+                    elif liveaction.status == action_constants.LIVEACTION_STATUS_SUCCEEDED:
+                        action_node = self.chain_holder.get_next_node(action_node.name,
+                                                                      condition='on-success')
+                except Exception as e:
+                    LOG.exception('Failed to get next node "%s".', action_node.name)
+
+                    fail = True
+                    error = ('Failed to get next node "%s". Lookup failed: %s' %
+                             (action_node.name, str(e)))
+                    trace = traceback.format_exc(10)
+                    top_level_error = {
+                        'error': error,
+                        'traceback': trace
+                    }
+                    # reset action_node here so that chain breaks on failure.
+                    action_node = None
+                    break
+
+                if self._stopped:
+                    LOG.info('Chain execution (%s) canceled by user.', self.liveaction_id)
+                    status = action_constants.LIVEACTION_STATUS_CANCELED
+                    return (status, result, None)
+
+        if fail:
+            status = action_constants.LIVEACTION_STATUS_FAILED
+        elif timeout:
+            status = action_constants.LIVEACTION_STATUS_TIMED_OUT
+        else:
+            status = action_constants.LIVEACTION_STATUS_SUCCEEDED
+
+        if top_level_error:
+            # Include top level error information
+            result['error'] = top_level_error['error']
+            result['traceback'] = top_level_error['traceback']
+
+        return (status, result, None)
+
+    def pause(self):
+        # Identify the list of action executions that are workflows and cascade pause.
+        for child_exec_id in self.execution.children:
+            child_exec = ActionExecution.get(id=child_exec_id, raise_exception=True)
+            if (child_exec.runner['name'] in action_constants.WORKFLOW_RUNNER_TYPES and
+                    child_exec.status == action_constants.LIVEACTION_STATUS_RUNNING):
+                action_service.request_pause(
+                    LiveAction.get(id=child_exec.liveaction['id']),
+                    self.context.get('user', None)
+                )
+
+        return (
+            action_constants.LIVEACTION_STATUS_PAUSING,
+            self.liveaction.result,
+            self.liveaction.context
+        )
+
+    def resume(self):
+        # Restore chain holder
+        if not self.chain_holder:
+            self.pre_run()
+
+        # Restore action parameters
+        _, action_parameters = param_utils.render_final_params(
+            self.runner_type_db.runner_parameters,
+            self.action.parameters,
+            self.liveaction.parameters,
+            self.liveaction.context
+        )
+
+        # Restore result and published vars from the liveaction.
+        result = self.liveaction.result or {'tasks': []}
+
+        if self._display_published and PUBLISHED_VARS_KEY not in result:
+            result[PUBLISHED_VARS_KEY] = {}
+
+        # Rebuild context_result
+        context_result = {}
+        for task in result['tasks']:
+            context_result[task['name']] = task['result']
+
+        # Rebuild top_level_error
+        top_level_error = None
+        if 'error' in result or 'traceback' in result:
+            top_level_error = {
+                'error': result.get('error'),
+                'traceback': result.get('traceback')
+            }
+
+        # Identify the last task executed.
+        action_node = None
+        liveaction = None
+        resume_action_node = False
+
+        if len(result['tasks']) > 0:
+            last_task = result['tasks'][-1]
+
+            if last_task['state'] == action_constants.LIVEACTION_STATUS_CANCELED:
+                return (action_constants.LIVEACTION_STATUS_CANCELED, result, None)
+
+            if last_task['state'] == action_constants.LIVEACTION_STATUS_PAUSED:
+                action_node = self.chain_holder.get_node(last_task['name'])
+                liveaction = action_db_util.get_liveaction_by_id(last_task['liveaction_id'])
+                resume_action_node = True
+
+            if last_task['state'] in action_constants.LIVEACTION_COMPLETED_STATES:
+                last_task_condition = (
+                    'on-failure'
+                    if last_task['state'] in action_constants.LIVEACTION_FAILED_STATES
+                    else 'on-success'
+                )
+
+                action_node = self.chain_holder.get_next_node(
+                    last_task['name'],
+                    condition=last_task_condition
+                )
+
+        fail = True
+
+        # TODO: Restore chain holder vars
+
+        # Setup parent context.
+        parent_context = {
+            'execution_id': self.execution_id
+        }
+
+        if getattr(self.liveaction, 'context', None):
+            parent_context.update(self.liveaction.context)
+
+        while action_node:
+            fail = False
+            timeout = False
+            error = None
+
+            created_at = date_utils.get_datetime_utc_now()
+
+            if not resume_action_node or not liveaction:
+                try:
+                    liveaction = self._get_next_action(
+                        action_node=action_node, parent_context=parent_context,
+                        action_params=action_parameters, context_result=context_result)
+                except action_exc.InvalidActionReferencedException as e:
+                    error = ('Failed to run task "%s". Action with reference "%s" doesn\'t exist.' %
+                             (action_node.name, action_node.ref))
+                    LOG.exception(error)
+
+                    fail = True
+                    top_level_error = {
+                        'error': error,
+                        'traceback': traceback.format_exc(10)
+                    }
+                    break
+                except action_exc.ParameterRenderingFailedException as e:
+                    # Rendering parameters failed before we even got to running this action,
+                    # abort and fail the whole action chain
+                    LOG.exception('Failed to run action "%s".', action_node.name)
+
+                    fail = True
+                    error = ('Failed to run task "%s". Parameter rendering failed: %s' %
+                             (action_node.name, str(e)))
+                    trace = traceback.format_exc(10)
+                    top_level_error = {
+                        'error': error,
+                        'traceback': trace
+                    }
+                    break
+
+            try:
+                liveaction = (
+                    self._resume_action(liveaction)
+                    if resume_action_node
+                    else self._run_action(liveaction)
+                )
+            except Exception as e:
+                # Save the traceback and error message
+                LOG.exception('Failure in running action "%s".', action_node.name)
+
+                error = {
+                    'error': 'Task "%s" failed: %s' % (action_node.name, str(e)),
+                    'traceback': traceback.format_exc(10)
+                }
+                context_result[action_node.name] = error
+            else:
+                # Update context result
+                context_result[action_node.name] = liveaction.result
+
+                # Render and publish variables
+                rendered_publish_vars = ActionChainRunner._render_publish_vars(
+                    action_node=action_node, action_parameters=action_parameters,
+                    execution_result=liveaction.result, previous_execution_results=context_result,
+                    chain_vars=self.chain_holder.vars)
+
+                if rendered_publish_vars:
+                    self.chain_holder.vars.update(rendered_publish_vars)
+                    if self._display_published:
+                        result[PUBLISHED_VARS_KEY].update(rendered_publish_vars)
+            finally:
+                # Record result and resolve a next node based on the task success or failure
+                updated_at = date_utils.get_datetime_utc_now()
+
+                format_kwargs = {'action_node': action_node, 'liveaction_db': liveaction,
+                                 'created_at': created_at, 'updated_at': updated_at}
+
+                if error:
+                    format_kwargs['error'] = error
+
+                task_result = self._format_action_exec_result(**format_kwargs)
+                result['tasks'].append(task_result)
+
+                if self.liveaction_id:
+                    self._stopped = action_service.is_action_canceled_or_canceling(
+                        self.liveaction_id)
+
+                if self._stopped:
+                    LOG.info('Chain execution (%s) canceled by user.', self.liveaction_id)
+                    status = action_constants.LIVEACTION_STATUS_CANCELED
+                    return (status, result, None)
+
                 try:
                     if not liveaction:
                         fail = True
@@ -446,6 +694,9 @@ class ActionChainRunner(ActionRunner):
                     LOG.info('Chain execution (%s) canceled by user.', self.liveaction_id)
                     status = action_constants.LIVEACTION_STATUS_CANCELED
                     return (status, result, None)
+
+                resume_action_node = False
+                liveaction = None
 
         if fail:
             status = action_constants.LIVEACTION_STATUS_FAILED
@@ -583,8 +834,34 @@ class ActionChainRunner(ActionRunner):
             LOG.exception('Failed to schedule liveaction.')
             raise e
 
-        while (wait_for_completion and
-                liveaction.status not in action_constants.LIVEACTION_COMPLETED_STATES):
+        while (wait_for_completion and liveaction.status not in (
+                action_constants.LIVEACTION_COMPLETED_STATES +
+                [action_constants.LIVEACTION_STATUS_PAUSED])):
+            eventlet.sleep(sleep_delay)
+            liveaction = action_db_util.get_liveaction_by_id(liveaction.id)
+
+        return liveaction
+
+    def _resume_action(self, liveaction, wait_for_completion=True, sleep_delay=1.0):
+        """
+        :param sleep_delay: Number of seconds to wait during "is completed" polls.
+        :type sleep_delay: ``float``
+        """
+        try:
+            liveaction, _ = action_service.request_resume(
+                liveaction,
+                self.context.get('user', None)
+            )
+
+            liveaction = action_db_util.get_liveaction_by_id(liveaction.id)
+        except Exception as e:
+            liveaction.status = action_constants.LIVEACTION_STATUS_FAILED
+            LOG.exception('Failed to schedule liveaction.')
+            raise e
+
+        while (wait_for_completion and liveaction.status not in (
+                action_constants.LIVEACTION_COMPLETED_STATES +
+                [action_constants.LIVEACTION_STATUS_PAUSED])):
             eventlet.sleep(sleep_delay)
             liveaction = action_db_util.get_liveaction_by_id(liveaction.id)
 
@@ -636,6 +913,7 @@ class ActionChainRunner(ActionRunner):
         result['id'] = action_node.name
         result['name'] = action_node.name
         result['execution_id'] = str(execution_db.id) if execution_db else None
+        result['liveaction_id'] = str(liveaction_db.id) if liveaction_db else None
         result['workflow'] = None
 
         result['created_at'] = isotime.format(dt=created_at)

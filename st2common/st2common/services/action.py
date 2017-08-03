@@ -187,6 +187,12 @@ def is_action_canceled_or_canceling(liveaction_id):
                                     action_constants.LIVEACTION_STATUS_CANCELING]
 
 
+def is_action_paused_or_pausing(liveaction_id):
+    liveaction_db = action_utils.get_liveaction_by_id(liveaction_id)
+    return liveaction_db.status in [action_constants.LIVEACTION_STATUS_PAUSED,
+                                    action_constants.LIVEACTION_STATUS_PAUSING]
+
+
 def request_cancellation(liveaction, requester):
     """
     Request cancellation of an action execution.
